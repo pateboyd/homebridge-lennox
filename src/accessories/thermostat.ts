@@ -141,7 +141,8 @@ export class ThermostatAccessory {
     // Register callbacks for push updates
     this.zone.registerOnUpdateCallback(() => {
       this.updateCharacteristics();
-    }, ['temperature', 'humidity', 'systemMode', 'tempOperation', 'hsp', 'hspC', 'csp', 'cspC', 'sp', 'spC']);
+    }, ['temperature', 'humidity', 'systemMode', 'tempOperation', 'hsp', 'hspC', 'csp', 'cspC', 'sp', 'spC',
+      'minHsp', 'maxHsp', 'minCsp', 'maxCsp', 'minHspC', 'maxHspC', 'minCspC', 'maxCspC']);
   }
 
   /**
@@ -387,6 +388,10 @@ export class ThermostatAccessory {
         mode = LENNOX_HVAC_OFF;
         break;
     }
+
+    // Re-selecting the current mode must not switch a scheduled thermostat
+    // into manual operation. This is especially important in Perfect Temp.
+    if (this.zone.systemMode === mode) return;
 
     try {
       await this.zone.setHVACMode(mode);
