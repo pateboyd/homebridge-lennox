@@ -92,3 +92,12 @@ test('Generic Auto target shifts both thresholds without discarding range', asyn
   assert.equal(publishes.length, 1);
   assert.equal(publishes[0].cspC - publishes[0].hspC, 3);
 });
+
+test('Auto range moves honor Lennox minimum heat/cool separation', async () => {
+  const {thermostat, publishes} = setup(false);
+  await Promise.all([
+    thermostat.setHeatingThreshold(24),
+    thermostat.setCoolingThreshold(24.5),
+  ]);
+  assert.deepEqual(publishes, [{hspC: 24, cspC: 25.5}]);
+});
