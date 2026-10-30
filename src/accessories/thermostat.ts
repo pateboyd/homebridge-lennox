@@ -216,6 +216,20 @@ export class ThermostatAccessory {
     this.pendingSetpoints = {};
     this.pendingWaiters = [];
 
+    // HomeKit may drag the two limits closer than the S30's allowed
+    // heat/cool separation. Correct the pair before submitting it.
+    if (!this.zone.system.singleSetpointMode &&
+        pending.hspC !== undefined && pending.cspC !== undefined) {
+      const minimumGap = this.zone.system.hspCCspCSeparation;
+      if (pending.cspC < pending.hspC + minimumGap) {
+        const maxCool = this.temperatureProps('cool').maxValue;
+        pending.cspC = Math.min(maxCool, pending.hspC + minimumGap);
+        if (pending.cspC < pending.hspC + minimumGap) {
+          pending.hspC = Math.max(this.temperatureProps('heat').minValue,
+            pending.cspC - minimumGap);
+        }
+      }
+    }
     const work = this.writeTail.then(() => this.zone.performSetpoint(pending));
     this.writeTail = work.then(() => undefined, () => undefined);
     void work.then(
