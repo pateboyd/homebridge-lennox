@@ -101,3 +101,11 @@ test('Auto range moves honor Lennox minimum heat/cool separation', async () => {
   ]);
   assert.deepEqual(publishes, [{hspC: 24, cspC: 25.5}]);
 });
+
+test('Selecting the current Auto mode does not interrupt the S30 schedule', async () => {
+  const {thermostat, zone} = setup(true);
+  let modeWrites = 0;
+  zone.setHVACMode = async () => { modeWrites += 1; };
+  await thermostat.setTargetHeatingCoolingState(char.TargetHeatingCoolingState.AUTO);
+  assert.equal(modeWrites, 0);
+});
