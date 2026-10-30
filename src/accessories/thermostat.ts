@@ -20,6 +20,11 @@ const LENNOX_TEMP_OPERATION_COOLING = 'cooling';
  */
 export class ThermostatAccessory {
   private service: Service;
+  // HomeKit sends Auto heat/cool changes as separate writes.
+  private pendingSetpoints: { hspC?: number; cspC?: number; spC?: number } = {};
+  private pendingWaiters: Array<{resolve: () => void; reject: (reason: unknown) => void}> = [];
+  private pendingTimer: NodeJS.Timeout | null = null;
+  private writeTail: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly platform: LennoxS30Platform,
@@ -73,11 +78,7 @@ export class ThermostatAccessory {
     this.service.getCharacteristic(this.platform.Characteristic.TargetTemperature)
       .onGet(this.getTargetTemperature.bind(this))
       .onSet(this.setTargetTemperature.bind(this))
-      .setProps({
-        minValue: 10,
-        maxValue: 35,
-        minStep: 0.5,
-      });
+      .setProps(this.temperatureProps('target'));
     this.service.updateCharacteristic(this.platform.Characteristic.TargetTemperature, targetTemp);
     this.platform.log.info(`  TargetTemperature=${targetTemp} (range 10-35)`)
 
@@ -90,11 +91,7 @@ export class ThermostatAccessory {
       this.service.getCharacteristic(this.platform.Characteristic.HeatingThresholdTemperature)
         .onGet(this.getHeatingThreshold.bind(this))
         .onSet(this.setHeatingThreshold.bind(this))
-        .setProps({
-          minValue: 10,
-          maxValue: 35,
-          minStep: 0.5,
-        });
+        .setProps(this.temperatureProps('heat'));
       this.service.updateCharacteristic(this.platform.Characteristic.HeatingThresholdTemperature, heatingThreshold);
       this.platform.log.info(`  HeatingThresholdTemperature=${heatingThreshold} (range 10-35)`);
 
@@ -102,11 +99,7 @@ export class ThermostatAccessory {
       this.service.getCharacteristic(this.platform.Characteristic.CoolingThresholdTemperature)
         .onGet(this.getCoolingThreshold.bind(this))
         .onSet(this.setCoolingThreshold.bind(this))
-        .setProps({
-          minValue: 10,
-          maxValue: 35,
-          minStep: 0.5,
-        });
+        .setProps(this.temperatureProps('cool'));
       this.service.updateCharacteristic(this.platform.Characteristic.CoolingThresholdTemperature, coolingThreshold);
       this.platform.log.info(`  CoolingThresholdTemperature=${coolingThreshold} (range 10-35)`);
     } else {
@@ -180,7 +173,69 @@ export class ThermostatAccessory {
   /**
    * Update characteristics from zone state (called via callback)
    */
+  private temperatureProps(kind: 'target' | 'heat' | 'cool'): {minValue: number; maxValue: number; minStep: number} {
+    // Respect thermostat's own configurable setpoint limits.
+    const z = this.zone;
+    const fromF = (value: number | null): number | null => value === null ? null : this.fToC(value);
+    const heatMin = z.minHspC ?? fromF(z.minHsp);
+    const heatMax = z.maxHspC ?? fromF(z.maxHsp);
+    const coolMin = z.minCspC ?? fromF(z.minCsp);
+    const coolMax = z.maxCspC ?? fromF(z.maxCsp);
+    const min = kind === 'heat' ? heatMin : kind === 'cool' ? coolMin :
+      z.system.singleSetpointMode ? Math.max(heatMin ?? 10, coolMin ?? 10) : heatMin;
+    const max = kind === 'heat' ? heatMax : kind === 'cool' ? coolMax :
+      z.system.singleSetpointMode ? Math.min(heatMax ?? 35, coolMax ?? 35) : coolMax;
+    return { minValue: min ?? 10, maxValue: Math.max(min ?? 10, max ?? 35), minStep: 0.5 };
+  }
+
+  private clampSetpoint(value: number, kind: 'target' | 'heat' | 'cool'): number {
+    const { minValue, maxValue } = this.temperatureProps(kind);
+    const clamped = Math.min(maxValue, Math.max(minValue, value));
+    if (clamped !== value) {
+      this.platform.log.warn(`Requested ${kind} setpoint ${value}°C outside Lennox limits (${minValue}–${maxValue}°C); using ${clamped}°C`);
+    }
+    return clamped;
+  }
+
+  private queueSetpoint(update: {hspC?: number; cspC?: number; spC?: number}): Promise<void> {
+    if (update.hspC !== undefined || update.cspC !== undefined) {
+      delete this.pendingSetpoints.spC;
+    }
+    this.pendingSetpoints = { ...this.pendingSetpoints, ...update };
+    return new Promise<void>((resolve, reject) => {
+      this.pendingWaiters.push({resolve, reject});
+      if (this.pendingTimer) clearTimeout(this.pendingTimer);
+      this.pendingTimer = setTimeout(() => this.flushSetpoints(), 400);
+    });
+  }
+
+  private flushSetpoints(): void {
+    this.pendingTimer = null;
+    const pending = this.pendingSetpoints;
+    const waiters = this.pendingWaiters;
+    this.pendingSetpoints = {};
+    this.pendingWaiters = [];
+
+    const work = this.writeTail.then(() => this.zone.performSetpoint(pending));
+    this.writeTail = work.then(() => undefined, () => undefined);
+    void work.then(
+      () => waiters.forEach(w => w.resolve()),
+      error => {
+        this.platform.log.error('Lennox setpoint update failed:', (error as Error).message);
+        waiters.forEach(w => w.reject(error));
+      },
+    );
+  }
+
   private updateCharacteristics(): void {
+    this.service.getCharacteristic(this.platform.Characteristic.TargetTemperature)
+      .setProps(this.temperatureProps('target'));
+    if (!this.zone.system.singleSetpointMode) {
+      this.service.getCharacteristic(this.platform.Characteristic.HeatingThresholdTemperature)
+        .setProps(this.temperatureProps('heat'));
+      this.service.getCharacteristic(this.platform.Characteristic.CoolingThresholdTemperature)
+        .setProps(this.temperatureProps('cool'));
+    }
     this.service.updateCharacteristic(
       this.platform.Characteristic.CurrentTemperature,
       this.getCurrentTemperature(),
@@ -370,32 +425,29 @@ export class ThermostatAccessory {
    * Set target temperature
    */
   async setTargetTemperature(value: CharacteristicValue): Promise<void> {
-    const tempC = value as number;
+    const tempC = this.clampSetpoint(value as number, 'target');
+    if (this.zone.system.singleSetpointMode) {
+      // Single setpoint: never modify Perfect Temp mode.
+      return this.queueSetpoint({ spC: tempC });
+    }
 
-    try {
-      if (this.zone.system.singleSetpointMode) {
-        // Single setpoint mode
-        await this.zone.performSetpoint({ spC: tempC });
-      } else {
-        // Dual setpoint mode - set based on current mode
-        switch (this.zone.systemMode) {
-          case LENNOX_HVAC_HEAT:
-          case LENNOX_HVAC_EMERGENCY_HEAT:
-            await this.zone.performSetpoint({ hspC: tempC });
-            break;
-          case LENNOX_HVAC_COOL:
-            await this.zone.performSetpoint({ cspC: tempC });
-            break;
-          case LENNOX_HVAC_HEAT_COOL:
-            // In auto mode, adjust both to maintain separation
-            await this.zone.performSetpoint({ cspC: tempC });
-            break;
-        }
+    switch (this.zone.systemMode) {
+      case LENNOX_HVAC_HEAT:
+      case LENNOX_HVAC_EMERGENCY_HEAT:
+        return this.queueSetpoint({ hspC: this.clampSetpoint(tempC, 'heat') });
+      case LENNOX_HVAC_COOL:
+        return this.queueSetpoint({ cspC: this.clampSetpoint(tempC, 'cool') });
+      case LENNOX_HVAC_HEAT_COOL: {
+        // Preserve the range width on a generic target move in split Auto.
+        const width = Math.max(this.zone.system.hspCCspCSeparation,
+          (this.zone.cspC ?? 24) - (this.zone.hspC ?? 21));
+        const heat = this.clampSetpoint(tempC - width / 2, 'heat');
+        const cool = this.clampSetpoint(Math.max(heat + this.zone.system.hspCCspCSeparation,
+          tempC + width / 2), 'cool');
+        return this.queueSetpoint({ hspC: heat, cspC: cool });
       }
-      this.platform.log.debug(`Set target temperature to ${tempC}°C for zone ${this.zone.id}`);
-    } catch (error) {
-      this.platform.log.error('Failed to set target temperature:', (error as Error).message);
-      throw error;
+      default:
+        return;
     }
   }
 
@@ -420,7 +472,7 @@ export class ThermostatAccessory {
     const tempC = value as number;
 
     try {
-      await this.zone.performSetpoint({ hspC: tempC });
+      await this.queueSetpoint({ hspC: this.clampSetpoint(tempC, 'heat') });
       this.platform.log.debug(`Set heating threshold to ${tempC}°C for zone ${this.zone.id}`);
     } catch (error) {
       this.platform.log.error('Failed to set heating threshold:', (error as Error).message);
@@ -449,7 +501,7 @@ export class ThermostatAccessory {
     const tempC = value as number;
 
     try {
-      await this.zone.performSetpoint({ cspC: tempC });
+      await this.queueSetpoint({ cspC: this.clampSetpoint(tempC, 'cool') });
       this.platform.log.debug(`Set cooling threshold to ${tempC}°C for zone ${this.zone.id}`);
     } catch (error) {
       this.platform.log.error('Failed to set cooling threshold:', (error as Error).message);
