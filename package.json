@@ -22,7 +22,8 @@
     "build": "rimraf ./dist && tsc",
     "watch": "npm run build && npm link && nodemon",
     "prepublishOnly": "npm run build",
-    "prepare": "npm run build"
+    "prepare": "npm run build",
+    "test": "npm run build && node --test tests/*.test.cjs"
   },
   "keywords": [
     "homebridge-plugin",
